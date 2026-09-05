@@ -63,7 +63,12 @@ SEAT_STATE: dict[str, Availability] = {
 }
 
 SUCCESS = "SUCC"
-_BLOCK_CODES = {"IRZ000063", "WRG000000"}   # 과도한 요청 / 비정상 접근 계열
+
+#: 자동화 탐지·차단을 뜻하는 코드. 재시도하면 안 된다.
+#: "MACRO ERROR"는 코레일이 매크로를 탐지했을 때 주는 코드로, 본문에는
+#: "앱을 최신 버전으로 업데이트하라"는 무관한 안내가 실려 온다. 본문 문구만
+#: 보고 버전 문제로 오해하면 차단된 계정에 로그인을 반복하게 된다.
+_BLOCK_CODES = {"MACRO ERROR", "IRZ000063", "WRG000000"}
 _SOLDOUT_HINTS = ("잔여석", "매진", "좌석", "선택하신 열차")
 # ───────────────────────── END WIRE FORMAT ─────────────────────────
 
@@ -323,6 +328,10 @@ class KorailProvider(RailProvider):
                 return self._handle_result(
                     data, action=action, is_login=(url == EP_LOGIN), allow_empty=allow_empty
                 )
+            except BlockedError:
+                # 차단은 재시도 대상이 아니다. 조건을 바꿔 다시 두드리는 것이
+                # 정확히 하지 말아야 할 행동이다.
+                raise
             except (LoginError, ResponseError) as exc:
                 if not self._should_retry_with_new_version(str(exc), tried):
                     raise
@@ -384,7 +393,10 @@ class KorailProvider(RailProvider):
         code = str(data.get("h_msg_cd", "")).strip()
         msg = str(data.get("h_msg_txt", "")).strip() or "알 수 없는 오류"
         if code in _BLOCK_CODES:
-            raise BlockedError(f"코레일이 요청을 거부했습니다({code}): {msg}")
+            raise BlockedError(
+                f"코레일이 자동화 프로그램으로 판단해 요청을 차단했습니다 "
+                f"[{code}]: {msg}"
+            )
         if is_login:
             raise LoginError(f"코레일 로그인 실패: {msg}")
         if "로그인" in msg or "세션" in msg:

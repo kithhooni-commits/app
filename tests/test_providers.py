@@ -340,3 +340,23 @@ class TestKorailErrorHandling(unittest.TestCase):
             provider.login("01012345678", "pw")
         self.assertEqual(provider.version, "999", "사용자가 고정한 버전은 바꾸지 않는다")
         self.assertEqual(len(provider.session.calls), 1)
+
+    def test_macro_detection_is_not_retried_as_version_problem(self):
+        """MACRO ERROR 본문에는 '업데이트' 안내가 실려 오지만 버전 문제가 아니다.
+
+        본문 문구만 보고 재시도하면 차단된 계정에 로그인을 반복하게 된다.
+        """
+        provider = self._provider({
+            "login.Login": json.dumps({
+                "strResult": "FAIL",
+                "h_msg_cd": "MACRO ERROR",
+                "h_msg_txt": "원활한 서비스 이용을 위해 앱을 최신 버전으로 "
+                             "업데이트한 뒤 재실행 후 안정적인 환경에서 사용해 주시기 바랍니다.",
+            }),
+        })
+        from railcatch.errors import BlockedError
+
+        with self.assertRaises(BlockedError):
+            provider.login("01012345678", "pw")
+        self.assertEqual(len(provider.session.calls), 1, "차단 응답에 재시도하면 안 된다")
+        self.assertFalse(provider.logged_in)
