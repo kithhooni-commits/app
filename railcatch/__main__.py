@@ -18,13 +18,21 @@ import sys
 import threading
 import time
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .config import Settings
 from .errors import RailCatchError
 from .manager import WatchManager, build_notifier
 from .models import Availability, Provider, SeatClass, TimeWindow, parse_date
+from .waitlist import (
+    Stage,
+    WaitlistEntry,
+    WaitlistStore,
+    parse_departure,
+    send_due_reminders,
+    summarize,
+)
 from .providers import build_provider
 from .watcher import Watch, WatchSpec, WatchState
 
@@ -270,6 +278,81 @@ def cmd_stations(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+# ── waitlist ────────────────────────────────────────────────
+def _store(settings: Settings) -> WaitlistStore:
+    return WaitlistStore(settings.data_dir / "waitlist.json")
+
+
+def cmd_waitlist_add(args: argparse.Namespace, settings: Settings) -> int:
+    entry = WaitlistEntry(
+        train=args.train,
+        route=args.route,
+        depart_at=parse_departure(parse_date(args.day), args.time),
+        note=args.note or "",
+    )
+    if entry.departed:
+        print("이미 출발한 열차입니다.", file=sys.stderr)
+        return 1
+    _store(settings).add(entry)
+    print(f"추가됨: {entry.id}  {entry.title}")
+    print("코레일+ 앱에서 예약대기를 건 뒤 아래를 실행하세요:")
+    print(f"  python -m railcatch waitlist done {entry.id} --stage registered")
+    return 0
+
+
+def cmd_waitlist_list(args: argparse.Namespace, settings: Settings) -> int:
+    store = _store(settings)
+    entries = store.load() if args.all else store.active()
+    print(summarize(entries))
+    return 0
+
+
+def cmd_waitlist_stage(args: argparse.Namespace, settings: Settings) -> int:
+    deadline = None
+    if args.deadline:
+        deadline = parse_departure(parse_date(args.deadline_day or args.day_today), args.deadline)
+    entry = _store(settings).set_stage(args.id, Stage(args.stage), pay_deadline=deadline)
+    print(f"{entry.id}  {entry.title} → {entry.stage.label}")
+    return 0
+
+
+def cmd_waitlist_remove(args: argparse.Namespace, settings: Settings) -> int:
+    if not _store(settings).remove(args.id):
+        print(f"그런 항목이 없습니다: {args.id}", file=sys.stderr)
+        return 1
+    print("삭제했습니다.")
+    return 0
+
+
+def cmd_waitlist_watch(args: argparse.Namespace, settings: Settings) -> int:
+    """알림을 보낼 때가 됐는지 주기적으로 확인한다.
+
+    코레일 서버에는 아무 요청도 보내지 않는다. 로컬 파일과 시계만 본다.
+    """
+    store = _store(settings)
+    notifier = build_notifier(settings)
+    interval = max(args.every, 60)
+
+    if args.once:
+        sent = send_due_reminders(store, notifier)
+        print(f"알림 {len(sent)}건 발송")
+        return 0
+
+    print(f"예약대기 알림 감시 시작 ({interval}초마다 확인) · Ctrl+C 로 중단")
+    print(summarize(store.active()))
+    stop = _install_sigint()
+    try:
+        while not stop.is_set():
+            store.purge_departed()
+            sent = send_due_reminders(store, notifier)
+            for entry, kind in sent:
+                log.info("알림 발송: %s [%s]", entry.title, kind.value)
+            stop.wait(interval)
+    finally:
+        print("\n중단했습니다.", file=sys.stderr)
+    return 0
+
+
 # ── telegram-chatid ─────────────────────────────────────────
 def cmd_telegram_chatid(args: argparse.Namespace, settings: Settings) -> int:
     from .notify import fetch_chat_ids
@@ -370,6 +453,42 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", choices=[p.value for p in Provider], default="korail")
     p.add_argument("--refresh", action="store_true", help="서버에서 새로 받기 (코레일만)")
     p.set_defaults(func=cmd_stations)
+
+    wl = sub.add_parser("waitlist", help="예약대기 관리 (코레일 서버에 요청하지 않음)")
+    wlsub = wl.add_subparsers(dest="waitlist_command", required=True)
+
+    q = wlsub.add_parser("add", help="예약대기 후보 열차 추가")
+    q.add_argument("train", help='열차 (예: "KTX 101")')
+    q.add_argument("route", help='구간 (예: "서울→부산")')
+    q.add_argument("day", help="출발 날짜 (2026-09-20 또는 9/20)")
+    q.add_argument("time", help="출발 시각 (08:30)")
+    q.add_argument("--note", help="메모")
+    q.set_defaults(func=cmd_waitlist_add)
+
+    q = wlsub.add_parser("list", help="목록 보기")
+    q.add_argument("--all", action="store_true", help="완료·출발한 항목까지")
+    q.set_defaults(func=cmd_waitlist_list)
+
+    q = wlsub.add_parser("done", help="상태 변경")
+    q.add_argument("id")
+    q.add_argument(
+        "--stage",
+        choices=[s.value for s in Stage],
+        default="registered",
+        help="registered=대기 걸어둠, assigned=배정됨, done=완료",
+    )
+    q.add_argument("--deadline", help="결제 기한 시각 (예: 18:40)")
+    q.add_argument("--deadline-day", help="결제 기한 날짜 (기본: 오늘)")
+    q.set_defaults(func=cmd_waitlist_stage, day_today=date.today().isoformat())
+
+    q = wlsub.add_parser("remove", help="항목 삭제")
+    q.add_argument("id")
+    q.set_defaults(func=cmd_waitlist_remove)
+
+    q = wlsub.add_parser("watch", help="알림 감시 (계속 실행)")
+    q.add_argument("--every", type=int, default=600, help="확인 주기(초). 기본 600")
+    q.add_argument("--once", action="store_true", help="한 번만 확인하고 종료")
+    q.set_defaults(func=cmd_waitlist_watch)
 
     p = sub.add_parser("telegram-chatid", help="텔레그램 chat_id 찾기")
     p.add_argument("--token")
