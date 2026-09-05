@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import ConfigError
+from .models import SeatClass
 from .notify.base import Notifier
 
 
@@ -67,6 +68,7 @@ class WaitlistEntry:
     train: str                     # "KTX 101"
     route: str                     # "서울→부산"
     depart_at: datetime
+    seat_class: SeatClass = SeatClass.ANY
     stage: Stage = Stage.PLANNED
     note: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -77,7 +79,10 @@ class WaitlistEntry:
 
     @property
     def title(self) -> str:
-        return f"{self.train} {self.route} {self.depart_at:%m/%d %H:%M}"
+        return (
+            f"{self.train} {self.route} {self.depart_at:%m/%d %H:%M} "
+            f"({self.seat_class.label})"
+        )
 
     @property
     def departed(self) -> bool:
@@ -117,7 +122,7 @@ class WaitlistEntry:
             return (
                 "📌 예약대기 등록하세요",
                 f"{self.title}\n출발까지 {left}\n\n"
-                "코레일+ 앱에서 해당 열차를 열고 예약대기를 걸어두세요.\n"
+                f"코레일+ 앱에서 해당 열차의 {self.seat_class.label} 예약대기를 걸어두세요.\n"
                 "먼저 걸수록 순번이 앞섭니다.",
             )
         if kind is Reminder.DAY_BEFORE:
@@ -147,6 +152,7 @@ class WaitlistEntry:
             "train": self.train,
             "route": self.route,
             "depart_at": self.depart_at.isoformat(),
+            "seat_class": self.seat_class.value,
             "stage": self.stage.value,
             "note": self.note,
             "created_at": self.created_at.isoformat(),
@@ -161,6 +167,7 @@ class WaitlistEntry:
             train=str(data["train"]),
             route=str(data["route"]),
             depart_at=datetime.fromisoformat(data["depart_at"]),
+            seat_class=SeatClass(data.get("seat_class", SeatClass.ANY.value)),
             stage=Stage(data.get("stage", "planned")),
             note=str(data.get("note", "")),
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -283,6 +290,43 @@ def send_due_reminders(
     if sent:
         store.save()
     return sent
+
+
+class ReminderLoop:
+    """예약대기 알림을 주기적으로 확인하는 백그라운드 스레드.
+
+    웹 UI를 켜두면 알림도 같이 돌게 하기 위한 것이다. 코레일 서버에는
+    아무 요청도 보내지 않으므로 감시 엔진과 달리 속도 제한이 필요 없다.
+    """
+
+    def __init__(self, store: "WaitlistStore", notifier: Notifier, interval: float = 300.0):
+        import threading
+
+        self.store = store
+        self.notifier = notifier
+        self.interval = max(interval, 30.0)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="waitlist-reminder", daemon=True)
+
+    def start(self) -> "ReminderLoop":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        import logging
+
+        log = logging.getLogger(__name__)
+        while not self._stop.is_set():
+            try:
+                self.store.purge_departed()
+                for entry, kind in send_due_reminders(self.store, self.notifier):
+                    log.info("예약대기 알림: %s [%s]", entry.title, kind.value)
+            except Exception:  # noqa: BLE001 - 스레드가 조용히 죽지 않게
+                log.exception("예약대기 알림 확인 실패")
+            self._stop.wait(self.interval)
 
 
 def parse_departure(day: date, hhmm: str) -> datetime:

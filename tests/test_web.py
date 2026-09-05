@@ -8,7 +8,8 @@ from pathlib import Path
 from railcatch.config import Credentials, Settings
 from railcatch.manager import WatchManager
 from railcatch.models import Provider
-from railcatch.web.server import _spec_from_payload, serve
+from railcatch.waitlist import WaitlistStore
+from railcatch.web.server import _entry_from_payload, _spec_from_payload, serve
 from tests.fakes import RecordingNotifier
 
 
@@ -61,13 +62,15 @@ class TestHttpApi(unittest.TestCase):
         settings.srt = Credentials("tester", "secret")
         settings.data_dir = Path("/tmp/railcatch-test-data")
         cls.manager = WatchManager(settings, notifier=RecordingNotifier())
-        cls.httpd = serve(cls.manager, "127.0.0.1", 0)
+        cls.store = WaitlistStore(settings.data_dir / "waitlist-test.json")
+        cls.httpd = serve(cls.manager, cls.store, "127.0.0.1", 0)
         cls.port = cls.httpd.server_address[1]
 
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.manager.shutdown()
+        cls.store.path.unlink(missing_ok=True)
 
     def get(self, path):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as r:
@@ -128,3 +131,119 @@ class TestHttpApi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEntryFromPayload(unittest.TestCase):
+    def payload(self, **kw):
+        base = {
+            "dep": "서울", "arr": "부산",
+            "day": (date.today() + timedelta(days=7)).isoformat(),
+            "time": "08:30", "train_type": "KTX", "train_number": "101",
+        }
+        base.update(kw)
+        return base
+
+    def test_builds_entry_from_dropdowns(self):
+        e = _entry_from_payload(self.payload(seat_class="general", note="메모"))
+        self.assertEqual(e.train, "KTX 101")
+        self.assertEqual(e.route, "서울→부산")
+        self.assertEqual(e.depart_at.strftime("%H:%M"), "08:30")
+        self.assertEqual(e.seat_class.value, "general")
+        self.assertEqual(e.note, "메모")
+        self.assertEqual(e.stage.value, "planned")
+
+    def test_train_number_is_optional(self):
+        e = _entry_from_payload(self.payload(train_number=""))
+        self.assertEqual(e.train, "KTX")
+
+    def test_seat_class_defaults_to_any(self):
+        self.assertEqual(_entry_from_payload(self.payload()).seat_class.value, "any")
+
+    def test_rejects_same_station(self):
+        with self.assertRaises(ValueError):
+            _entry_from_payload(self.payload(arr="서울"))
+
+    def test_rejects_missing_fields(self):
+        with self.assertRaises(ValueError) as ctx:
+            _entry_from_payload({"dep": "서울"})
+        self.assertIn("arr", str(ctx.exception))
+
+    def test_rejects_past_departure(self):
+        with self.assertRaises(ValueError):
+            _entry_from_payload(self.payload(day="2020-01-01"))
+
+    def test_rejects_bad_time(self):
+        with self.assertRaises(ValueError):
+            _entry_from_payload(self.payload(time="아침"))
+
+    def test_rejects_unknown_seat_class(self):
+        with self.assertRaises(ValueError):
+            _entry_from_payload(self.payload(seat_class="입석"))
+
+
+class TestWaitlistApi(TestHttpApi):
+    """예약대기 엔드포인트. TestHttpApi의 서버/헬퍼를 그대로 쓴다."""
+
+    def setUp(self):
+        for e in list(self.store.load()):
+            self.store.remove(e.id)
+
+    def add(self, **kw):
+        body = {
+            "dep": "서울", "arr": "부산",
+            "day": (date.today() + timedelta(days=7)).isoformat(),
+            "time": "08:30", "train_type": "KTX", "train_number": "101",
+        }
+        body.update(kw)
+        return self.post("/api/waitlist", body)
+
+    def test_meta_exposes_dropdown_choices(self):
+        _, data = self.get("/api/meta")
+        self.assertIn("서울", data["stations"])
+        self.assertIn("부산", data["stations"])
+        self.assertIn("KTX", data["train_types"])
+        self.assertEqual(
+            {s["value"] for s in data["seat_classes"]}, {"general", "special", "any"}
+        )
+
+    def test_add_then_list(self):
+        status, data = self.add(seat_class="special")
+        self.assertEqual(status, 201)
+        self.assertEqual(data["entry"]["seat_class"], "special")
+
+        _, listed = self.get("/api/waitlist")
+        self.assertEqual(len(listed["entries"]), 1)
+        self.assertEqual(listed["entries"][0]["train"], "KTX 101")
+
+    def test_add_rejects_bad_input_with_reason(self):
+        status, data = self.add(arr="서울")
+        self.assertEqual(status, 400)
+        self.assertIn("같습니다", data["error"])
+
+    def test_stage_transitions(self):
+        _, created = self.add()
+        entry_id = created["entry"]["id"]
+
+        _, data = self.post("/api/waitlist/stage", {"id": entry_id, "stage": "registered"})
+        self.assertEqual(data["entry"]["stage"], "registered")
+
+        _, data = self.post(
+            "/api/waitlist/stage",
+            {"id": entry_id, "stage": "assigned", "deadline": "18:40"},
+        )
+        self.assertEqual(data["entry"]["stage"], "assigned")
+        self.assertTrue(data["entry"]["pay_deadline"].endswith("18:40:00"))
+
+    def test_stage_unknown_id_returns_400(self):
+        status, _ = self.post("/api/waitlist/stage", {"id": "nope", "stage": "done"})
+        self.assertEqual(status, 400)
+
+    def test_remove(self):
+        _, created = self.add()
+        status, data = self.post("/api/waitlist/remove", {"id": created["entry"]["id"]})
+        self.assertEqual((status, data["ok"]), (200, True))
+        self.assertEqual(self.get("/api/waitlist")[1]["entries"], [])
+
+    def test_remove_unknown_returns_404(self):
+        status, _ = self.post("/api/waitlist/remove", {"id": "nope"})
+        self.assertEqual(status, 404)

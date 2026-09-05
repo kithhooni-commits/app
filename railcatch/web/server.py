@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 from ..errors import ConfigError, RailCatchError
 from ..manager import WatchManager
 from ..models import Provider, SeatClass, TimeWindow, parse_date
+from ..providers import stations as station_db
+from ..waitlist import Stage, WaitlistEntry, WaitlistStore, parse_departure
 from ..watcher import WatchSpec
 
 log = logging.getLogger(__name__)
@@ -30,8 +32,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "railcatch"
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, *args: Any, manager: WatchManager, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, manager: WatchManager, store: WaitlistStore, **kwargs: Any
+    ) -> None:
         self.manager = manager
+        self.store = store
         super().__init__(*args, **kwargs)
 
     # ── 라우팅 ──────────────────────────────────────────────
@@ -43,6 +48,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"watches": self.manager.snapshot()})
         if path == "/api/meta":
             return self._json(self._meta())
+        if path == "/api/waitlist":
+            return self._json({"entries": [e.to_dict() for e in self.store.active()]})
         self._error(404, "not found")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -65,6 +72,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": ok}, status=200 if ok else 404)
             if path == "/api/watches/clear":
                 return self._json({"removed": self.manager.clear_finished()})
+            if path == "/api/waitlist":
+                entry = _entry_from_payload(body)
+                self.store.add(entry)
+                return self._json({"entry": entry.to_dict()}, status=201)
+            if path == "/api/waitlist/stage":
+                deadline = _parse_deadline(body.get("deadline"))
+                entry = self.store.set_stage(
+                    str(body.get("id", "")), Stage(str(body.get("stage", "registered"))),
+                    pay_deadline=deadline,
+                )
+                return self._json({"entry": entry.to_dict()})
+            if path == "/api/waitlist/remove":
+                ok = self.store.remove(str(body.get("id", "")))
+                return self._json({"ok": ok}, status=200 if ok else 404)
         except (ConfigError, ValueError) as exc:
             return self._error(400, str(exc))
         except RailCatchError as exc:
@@ -89,6 +110,9 @@ class Handler(BaseHTTPRequestHandler):
             "telegram": settings.telegram_enabled,
             "today": date.today().isoformat(),
             "max_day": (date.today() + timedelta(days=30)).isoformat(),
+            "stations": _station_names(settings),
+            "train_types": TRAIN_TYPES,
+            "stages": [{"value": s.value, "label": s.label} for s in Stage],
         }
 
     def _read_json(self) -> dict[str, Any]:
@@ -178,14 +202,78 @@ def _spec_from_payload(body: dict[str, Any]) -> WatchSpec:
     )
 
 
-def serve(manager: WatchManager, host: str, port: int) -> ThreadingHTTPServer:
+#: 열차 종류. 번호는 사용자가 입력하고, 종류는 목록에서 고른다.
+TRAIN_TYPES = [
+    "KTX", "KTX-산천", "KTX-이음", "KTX-청룡", "SRT",
+    "ITX-새마을", "ITX-청춘", "ITX-마음", "무궁화호", "누리로",
+]
+
+
+def _station_names(settings: Any) -> list[str]:
+    """역 이름 목록. 서버에서 받아 캐시해 둔 것이 있으면 그쪽을 쓴다."""
+    cached = station_db.load_cached(Provider.KORAIL, settings.data_dir)
+    stations = cached or station_db.bundled(Provider.KORAIL)
+    return sorted({s.name for s in stations})
+
+
+def _parse_deadline(raw: Any) -> datetime | None:
+    """'2026-09-20T18:40' 또는 '18:40'(오늘 기준)을 datetime으로."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    return parse_departure(date.today(), text)
+
+
+def _entry_from_payload(body: dict[str, Any]) -> WaitlistEntry:
+    """웹 폼 입력을 예약대기 항목으로. 잘못된 입력은 ValueError로 400을 만든다."""
+    required = ("dep", "arr", "day", "time")
+    missing = [k for k in required if not str(body.get(k, "")).strip()]
+    if missing:
+        raise ValueError(f"필수 항목이 비었습니다: {', '.join(missing)}")
+
+    try:
+        seat_class = SeatClass(str(body.get("seat_class", SeatClass.ANY.value)))
+    except ValueError as exc:
+        raise ValueError(f"알 수 없는 좌석 등급: {body.get('seat_class')!r}") from exc
+
+    dep = str(body["dep"]).strip()
+    arr = str(body["arr"]).strip()
+    if dep == arr:
+        raise ValueError("출발역과 도착역이 같습니다.")
+
+    depart_at = parse_departure(parse_date(str(body["day"])), str(body["time"]))
+    if depart_at < datetime.now():
+        raise ValueError("이미 지난 시각입니다.")
+
+    train_type = str(body.get("train_type", "")).strip() or "열차"
+    number = str(body.get("train_number", "")).strip()
+    train = f"{train_type} {number}".strip()
+
+    return WaitlistEntry(
+        train=train,
+        route=f"{dep}→{arr}",
+        depart_at=depart_at,
+        seat_class=seat_class,
+        note=str(body.get("note", "")).strip(),
+    )
+
+
+def serve(
+    manager: WatchManager, store: WaitlistStore, host: str, port: int
+) -> ThreadingHTTPServer:
     if host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(
             "⚠ %s 로 바인딩합니다. 이 서버에는 인증이 없고 계정으로 예매를 실행합니다. "
             "신뢰할 수 없는 네트워크에 노출하지 마세요.",
             host,
         )
-    httpd = ThreadingHTTPServer((host, port), partial(Handler, manager=manager))
+    httpd = ThreadingHTTPServer(
+        (host, port), partial(Handler, manager=manager, store=store)
+    )
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, name="web", daemon=True)
     thread.start()

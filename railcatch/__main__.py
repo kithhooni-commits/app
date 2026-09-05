@@ -26,6 +26,7 @@ from .errors import RailCatchError
 from .manager import WatchManager, build_notifier
 from .models import Availability, Provider, SeatClass, TimeWindow, parse_date
 from .waitlist import (
+    ReminderLoop,
     Stage,
     WaitlistEntry,
     WaitlistStore,
@@ -65,10 +66,12 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
     host = args.host or settings.web_host
     port = args.port or settings.web_port
     manager = WatchManager(settings)
-    httpd = serve(manager, host, port)
+    store = _store(settings)
+    reminders = ReminderLoop(store, manager.notifier).start()
+    httpd = serve(manager, store, host, port)
     url = f"http://{host}:{port}/"
     print(f"railcatch 웹 UI: {url}  (Ctrl+C 로 종료)")
-    print(f"조회 간격 {settings.poll_interval:.1f}초 · "
+    print(f"예약대기 {len(store.active())}건 감시 중 · "
           f"텔레그램 {'설정됨' if settings.telegram_enabled else '미설정'}")
     if not args.no_browser:
         try:
@@ -82,6 +85,7 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
             time.sleep(0.4)
     finally:
         print("\n종료 중…", file=sys.stderr)
+        reminders.stop()
         httpd.shutdown()
         manager.shutdown()
     return 0
@@ -288,6 +292,7 @@ def cmd_waitlist_add(args: argparse.Namespace, settings: Settings) -> int:
         train=args.train,
         route=args.route,
         depart_at=parse_departure(parse_date(args.day), args.time),
+        seat_class=SeatClass(args.seat),
         note=args.note or "",
     )
     if entry.departed:
@@ -462,6 +467,7 @@ def _build_parser() -> argparse.ArgumentParser:
     q.add_argument("route", help='구간 (예: "서울→부산")')
     q.add_argument("day", help="출발 날짜 (2026-09-20 또는 9/20)")
     q.add_argument("time", help="출발 시각 (08:30)")
+    q.add_argument("--seat", choices=[s.value for s in SeatClass], default="any")
     q.add_argument("--note", help="메모")
     q.set_defaults(func=cmd_waitlist_add)
 
