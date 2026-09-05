@@ -50,6 +50,7 @@ class Settings:
     korail: Credentials = field(default_factory=Credentials)
     telegram_token: str = ""
     telegram_chat_id: str = ""
+    korail_version: str = ""   # 비우면 내장 후보를 자동으로 시도한다
     poll_interval: float = 3.0
     data_dir: Path = field(default_factory=lambda: Path("data"))
     web_host: str = "127.0.0.1"
@@ -92,6 +93,7 @@ class Settings:
         return cls(
             srt=Credentials(get("SRT_ID"), get("SRT_PW")),
             korail=Credentials(get("KORAIL_ID"), get("KORAIL_PW")),
+            korail_version=get("KORAIL_VERSION"),
             telegram_token=get("TELEGRAM_TOKEN"),
             telegram_chat_id=get("TELEGRAM_CHAT_ID"),
             poll_interval=interval,

@@ -14,7 +14,7 @@ from typing import Any
 
 from ..errors import BlockedError, LoginError, ResponseError, SoldOutError
 from ..models import Availability, Provider, Reservation, SeatClass, Station, Train
-from ..transport import RateLimiter, Session
+from ..transport import RateLimiter, Session, html_message, looks_like_html
 from . import stations as station_db
 from .base import RailProvider
 
@@ -23,11 +23,30 @@ log = logging.getLogger(__name__)
 # ─────────────────────────── WIRE FORMAT ───────────────────────────
 BASE = "https://app.srail.or.kr:443"
 EP_MAIN = f"{BASE}/main/main.do"
-EP_LOGIN = f"{BASE}/apb/selectListApb01080.do"
 EP_LOGOUT = f"{BASE}/login/loginOut.do"
-EP_SEARCH = f"{BASE}/ara/selectListAra10007.do"
-EP_RESERVE = f"{BASE}/arc/selectListArc05013.do"
-EP_RESERVATIONS = f"{BASE}/atc/selectListAtc14016.do"
+
+#: SRT는 같은 기능의 경로를 접미사만 바꿔 여러 벌 운영해 왔다(`_n` 유무).
+#: 어느 쪽이 살아있는지는 서버만 알기 때문에, 하나를 찍지 않고 순서대로
+#: 시도해서 JSON을 주는 경로를 찾아 기억한다. 실패한 경로는 HTML 오류
+#: 페이지를 돌려주므로 구분할 수 있다.
+ENDPOINTS: dict[str, tuple[str, ...]] = {
+    "login": (
+        f"{BASE}/apb/selectListApb01080_n.do",
+        f"{BASE}/apb/selectListApb01080.do",
+    ),
+    "search": (
+        f"{BASE}/ara/selectListAra10007_n.do",
+        f"{BASE}/ara/selectListAra10007.do",
+    ),
+    "reserve": (
+        f"{BASE}/arc/selectListArc05013_n.do",
+        f"{BASE}/arc/selectListArc05013.do",
+    ),
+    "reservations": (
+        f"{BASE}/atc/selectListAtc14016_n.do",
+        f"{BASE}/atc/selectListAtc14016.do",
+    ),
+}
 
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -70,7 +89,10 @@ class SRTProvider(RailProvider):
         )
         self._logged_in = False
         self._member_no: str | None = None
-        self.last_raw: Any = None  # doctor 명령이 들여다본다
+        self.last_raw: Any = None          # doctor 명령이 들여다본다
+        self.last_url: str | None = None   # 마지막으로 호출한 경로
+        #: 기능별로 실제 동작하는 것이 확인된 경로. 한 번 찾으면 재사용한다.
+        self.resolved: dict[str, str] = {}
 
     # ── 인증 ────────────────────────────────────────────────
     @property
@@ -89,26 +111,78 @@ class SRTProvider(RailProvider):
             "srchDvNm": user_id,
             "hmpgPwdCphd": password,
         }
-        resp = self.session.post(EP_LOGIN, data=payload)
-        body = resp.text
-        self.last_raw = body
+        data, body = self._post("login", payload, action="로그인")
 
-        if not resp.ok:
-            raise LoginError(f"SRT 로그인 요청 실패 (HTTP {resp.status})")
-        if "존재하지 않는 회원" in body or "비밀번호" in body and "확인" in body:
-            raise LoginError("SRT 로그인 실패: 아이디 또는 비밀번호를 확인하세요.")
-        _guard_blocked(body)
+        # 실패 판정은 '실패 문구가 없으면 성공'이 아니라, 성공 근거를 요구한다.
+        # 오류 페이지를 성공으로 오인하면 이후 모든 진단이 엉뚱한 곳을 가리킨다.
+        for marker in _LOGIN_FAILURE_TOKENS:
+            if marker in body:
+                raise LoginError(f"SRT 로그인 실패: {marker}")
 
-        m = re.search(r'"MB_CRD_NO"\s*:\s*"(\d+)"', body)
-        self._member_no = m.group(1) if m else None
+        member = _find_member_no(data, body)
+        if member is None and not _looks_logged_in(data, body):
+            raise LoginError(
+                "SRT 로그인 응답에서 성공 근거를 찾지 못했습니다. "
+                "아이디 형식(회원번호/이메일/휴대폰)과 비밀번호를 확인하세요. "
+                "--dump 로 원본 응답을 볼 수 있습니다."
+            )
+
+        self._member_no = member
         self._logged_in = True
-        log.info("SRT 로그인 성공%s", f" (회원번호 {self._member_no})" if self._member_no else "")
+        log.info("SRT 로그인 성공%s", f" (회원번호 {member})" if member else "")
 
     def logout(self) -> None:
         if self._logged_in:
-            self.session.post(EP_LOGOUT)
+            try:
+                self.session.post(EP_LOGOUT)
+            except Exception:  # noqa: BLE001 - 종료 경로에서 실패를 전파하지 않는다
+                pass
         self.session.clear_cookies()
         self._logged_in = False
+
+    # ── 경로 탐색 ───────────────────────────────────────────
+    def _post(self, kind: str, payload: dict[str, Any], *, action: str) -> tuple[Any, str]:
+        """`kind` 기능의 후보 경로를 순서대로 시도해 JSON을 주는 쪽을 쓴다.
+
+        한 번 성공한 경로는 기억해 이후에는 바로 그 경로만 호출한다.
+        반환값은 (파싱된 JSON 또는 None, 원본 본문).
+        """
+        candidates = (self.resolved[kind],) if kind in self.resolved else ENDPOINTS[kind]
+        errors: list[str] = []
+
+        for url in candidates:
+            resp = self.session.post(url, data=payload)
+            self.last_url = url
+            body = resp.text
+            self.last_raw = body
+
+            if not resp.ok:
+                errors.append(f"{_short(url)} → HTTP {resp.status}")
+                continue
+            if looks_like_html(body):
+                hint = html_message(body)
+                errors.append(f"{_short(url)} → 오류 페이지({hint or 'HTML'})")
+                continue
+
+            _guard_blocked(body)
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001 - JSON이 아니면 다음 후보로
+                errors.append(f"{_short(url)} → JSON 아님")
+                continue
+
+            self.last_raw = data
+            if kind not in self.resolved:
+                log.info("SRT %s 경로 확정: %s", action, _short(url))
+            self.resolved[kind] = url
+            return data, body
+
+        # 확정해 둔 경로가 이제 와서 깨졌다면, 다음 호출에서 다시 탐색하게 한다.
+        self.resolved.pop(kind, None)
+        raise ResponseError(
+            f"SRT {action}: 사용 가능한 경로를 찾지 못했습니다 ({'; '.join(errors)}). "
+            f"SRT가 API를 변경했을 수 있습니다 — providers/srt.py 의 ENDPOINTS 를 확인하세요."
+        )
 
     # ── 역 ──────────────────────────────────────────────────
     def stations(self) -> list[Station]:
@@ -139,11 +213,7 @@ class SRTProvider(RailProvider):
             "dptRsStnCd": dep_st.code,
             "arvRsStnCd": arr_st.code,
         }
-        resp = self.session.post(EP_SEARCH, data=payload).raise_for_status()
-        _guard_blocked(resp.text)
-        data = resp.json()
-        self.last_raw = data
-
+        data, _ = self._post("search", payload, action="열차 조회")
         rows = _rows(data)
         trains = [t for t in (self._to_train(r, dep_st.name, arr_st.name) for r in rows) if t]
         if not include_soldout:
@@ -206,10 +276,7 @@ class SRTProvider(RailProvider):
             "locSeatAttCd1": "000",
             "etcSeatAttCd1": "000",
         }
-        resp = self.session.post(EP_RESERVE, data=payload).raise_for_status()
-        body = resp.text
-        self.last_raw = body
-        _guard_blocked(body)
+        data, body = self._post("reserve", payload, action="좌석 선점")
 
         if any(tok in body for tok in ("잔여석", "매진", "좌석이 없", "지정할 수 없")):
             raise SoldOutError("SRT: 선점 직전 좌석이 소진되었습니다.")
@@ -217,7 +284,6 @@ class SRTProvider(RailProvider):
             self._logged_in = False
             raise ResponseError("SRT 세션이 만료되었습니다. 재로그인이 필요합니다.")
 
-        data = resp.json()
         rows = _rows(data)
         if not rows:
             raise ResponseError(f"SRT 예약 응답을 해석하지 못했습니다: {body[:200]!r}")
@@ -301,6 +367,54 @@ def _deadline(day: Any, tm: Any) -> datetime | None:
         return _dt(str(day), str(tm))
     except ValueError:
         return None
+
+
+#: 로그인 실패를 명시하는 문구. 이 중 하나라도 있으면 무조건 실패로 본다.
+_LOGIN_FAILURE_TOKENS = (
+    "존재하지 않는 회원",
+    "비밀번호가 일치하지 않",
+    "로그인 정보가 올바르지",
+    "휴면",
+    "잠금",
+)
+
+#: 로그인이 실제로 되었을 때만 나타나는 흔적.
+_LOGIN_SUCCESS_TOKENS = ("SUCC", "userMap", "MB_CRD_NO", "CUST_NM")
+
+
+def _short(url: str) -> str:
+    return url.rsplit("/", 1)[-1]
+
+
+def _find_member_no(data: Any, body: str) -> str | None:
+    if isinstance(data, dict):
+        for key in ("MB_CRD_NO", "mbCrdNo", "custNo"):
+            value = _deep_get(data, key)
+            if value:
+                return str(value)
+    m = re.search(r'"MB_CRD_NO"\s*:\s*"?(\d+)', body)
+    return m.group(1) if m else None
+
+
+def _deep_get(data: Any, key: str) -> Any:
+    """중첩된 dict/list 안에서 key를 처음 만나는 값으로."""
+    if isinstance(data, dict):
+        if key in data:
+            return data[key]
+        for value in data.values():
+            found = _deep_get(value, key)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _deep_get(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _looks_logged_in(data: Any, body: str) -> bool:
+    return any(token in body for token in _LOGIN_SUCCESS_TOKENS)
 
 
 def _guard_blocked(body: str) -> None:

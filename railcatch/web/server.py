@@ -75,13 +75,14 @@ class Handler(BaseHTTPRequestHandler):
     def _meta(self) -> dict[str, Any]:
         settings = self.manager.settings
         return {
+            # 코레일을 먼저 둔다 — 통합 이후 SRT 예매 경로는 막힌 상태다.
             "providers": [
                 {
                     "value": p.value,
-                    "label": "SRT" if p is Provider.SRT else "코레일 (KTX/ITX)",
+                    "label": "코레일 (KTX/SRT 통합)" if p is Provider.KORAIL else "SRT (레거시)",
                     "configured": settings.credentials(p).present,
                 }
-                for p in Provider
+                for p in (Provider.KORAIL, Provider.SRT)
             ],
             "seat_classes": [{"value": s.value, "label": s.label} for s in SeatClass],
             "poll_interval": settings.poll_interval,

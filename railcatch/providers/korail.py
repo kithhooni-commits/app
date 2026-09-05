@@ -16,7 +16,7 @@ from typing import Any
 
 from ..errors import BlockedError, LoginError, ResponseError, SoldOutError
 from ..models import Availability, Provider, Reservation, SeatClass, Station, Train
-from ..transport import RateLimiter, Session
+from ..transport import RateLimiter, Session, html_message, looks_like_html
 from . import stations as station_db
 from .base import RailProvider
 
@@ -33,7 +33,13 @@ EP_STATION_DB = BASE + "common.stationinfo"
 
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; SM-S911N Build/TP1A.220624.014)"
 DEVICE = "AD"          # Android
-VERSION = "231231001"  # 앱 버전 문자열. 너무 낮으면 업데이트 요구 응답이 온다.
+
+#: 앱 버전 문자열. 서버가 너무 낮은 버전을 거부하면 다음 후보로 넘어간다.
+#: .env 의 KORAIL_VERSION 으로 덮어쓸 수 있다.
+VERSION_CANDIDATES: tuple[str, ...] = ("250401001", "240401001", "231231001", "190617001")
+
+#: 버전이 낮다고 거부당했음을 뜻하는 문구.
+_VERSION_HINTS = ("버전", "업데이트", "업그레이드", "최신")
 
 ID_TYPE_MEMBERSHIP = "1"
 ID_TYPE_EMAIL = "5"
@@ -73,6 +79,7 @@ class KorailProvider(RailProvider):
         timeout: float = 12.0,
         data_dir: Any = None,
         ktx_only: bool = False,
+        version: str | None = None,
     ) -> None:
         self.session = Session(
             headers={"User-Agent": USER_AGENT, "Accept": "application/json, text/plain, */*"},
@@ -85,7 +92,10 @@ class KorailProvider(RailProvider):
         self._stations: list[Station] | None = None
         self.data_dir = data_dir
         self.ktx_only = ktx_only
+        self.version = version or VERSION_CANDIDATES[0]
+        self._version_locked = bool(version)   # 사용자가 지정했으면 바꾸지 않는다
         self.last_raw: Any = None
+        self.last_url: str | None = None
 
     # ── 인증 ────────────────────────────────────────────────
     @property
@@ -95,15 +105,24 @@ class KorailProvider(RailProvider):
     def login(self, user_id: str, password: str) -> None:
         payload = {
             "Device": DEVICE,
-            "Version": VERSION,
+            "Version": self.version,
             "txtInputFlg": _id_type(user_id),
             "txtMemberNo": user_id,
             "txtPwd": password,
         }
         data = self._call(EP_LOGIN, payload, action="로그인")
+
+        # strResult가 SUCC라도 세션 키나 회원 식별자가 없으면 로그인된 것이 아니다.
+        # '실패 문구가 없으면 성공'으로 처리하면 이후 진단이 전부 엉뚱해진다.
         self._key = data.get("Key") or data.get("key")
-        profile = data.get("strCustNo") or data.get("strMbCrdNo")
+        profile = data.get("strCustNo") or data.get("strMbCrdNo") or data.get("strCustNm")
         self._member_no = str(profile) if profile else None
+        if not self._key and not self._member_no:
+            raise LoginError(
+                "코레일 로그인 응답에서 세션 정보를 찾지 못했습니다. "
+                "아이디 형식(회원번호/이메일/휴대폰)과 비밀번호를 확인하세요. "
+                "--dump 로 원본 응답을 볼 수 있습니다."
+            )
         self._logged_in = True
         log.info("코레일 로그인 성공%s", f" ({self._member_no})" if self._member_no else "")
 
@@ -162,7 +181,7 @@ class KorailProvider(RailProvider):
         arr_name = station_db.canonical(arr)
         payload = {
             "Device": DEVICE,
-            "Version": VERSION,
+            "Version": self.version,
             "radJobId": "1",                 # 1 = 편도
             "selGoTrain": TRAIN_GROUP_KTX if self.ktx_only else "05",
             "txtGoAbrdDt": day.strftime("%Y%m%d"),
@@ -227,7 +246,7 @@ class KorailProvider(RailProvider):
         seat_attr = SEAT_ATTR_SPECIAL if seat_class is SeatClass.SPECIAL else SEAT_ATTR_GENERAL
         payload = {
             "Device": DEVICE,
-            "Version": VERSION,
+            "Version": self.version,
             "Key": self._key or "",
             "txtGdNo": "",
             "txtJobId": "1101",              # 개인 예약
@@ -292,13 +311,56 @@ class KorailProvider(RailProvider):
         action: str,
         allow_empty: bool = False,
     ) -> dict[str, Any]:
-        """요청을 보내고 코레일 공통 응답 규약에 따라 해석한다."""
+        """요청을 보내고 코레일 공통 응답 규약에 따라 해석한다.
+
+        서버가 앱 버전을 거부하면 다음 버전 후보로 한 번 더 시도한다. 사용자가
+        .env 로 버전을 지정한 경우에는 임의로 바꾸지 않는다.
+        """
+        tried: list[str] = []
+        while True:
+            data = self._raw_call(url, payload, action=action)
+            try:
+                return self._handle_result(
+                    data, action=action, is_login=(url == EP_LOGIN), allow_empty=allow_empty
+                )
+            except (LoginError, ResponseError) as exc:
+                if not self._should_retry_with_new_version(str(exc), tried):
+                    raise
+                payload = {**payload, "Version": self.version}
+                log.info("코레일 앱 버전을 %s 로 바꿔 재시도합니다.", self.version)
+
+    def _raw_call(self, url: str, payload: dict[str, Any], *, action: str) -> Any:
+        """HTTP 호출과 JSON 파싱까지만. 오류 페이지를 JSON 파싱 실패로 뭉개지 않는다."""
         resp = self.session.post(url, data=payload).raise_for_status()
+        self.last_url = url
+        body = resp.text
+        self.last_raw = body
+
+        if looks_like_html(body):
+            hint = html_message(body)
+            raise ResponseError(
+                f"코레일 {action}: JSON 대신 오류 페이지가 왔습니다"
+                + (f" — {hint}" if hint else "")
+                + f" (경로 {url.rsplit('.', 1)[-1]}). "
+                "코레일이 API를 변경했을 수 있습니다 — providers/korail.py 의 "
+                "WIRE FORMAT 구역을 확인하세요."
+            )
         data = resp.json()
         self.last_raw = data
-        return self._handle_result(
-            data, action=action, is_login=(url == EP_LOGIN), allow_empty=allow_empty
-        )
+        return data
+
+    def _should_retry_with_new_version(self, message: str, tried: list[str]) -> bool:
+        """버전 거부로 보이면 다음 버전 후보를 고른다."""
+        if self._version_locked:
+            return False
+        if not any(hint in message for hint in _VERSION_HINTS):
+            return False
+        tried.append(self.version)
+        for candidate in VERSION_CANDIDATES:
+            if candidate not in tried:
+                self.version = candidate
+                return True
+        return False
 
     def _handle_result(
         self,

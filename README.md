@@ -19,20 +19,31 @@ SRT · 코레일(KTX) **빈자리 감시 및 자동 선점** 도구.
 - 서버가 요청을 거부하면(“비정상적인 접근” 등) 감시를 **즉시 중단**합니다. 계속 두드리는
   것보다 잠시 쉬는 편이 계정에 안전합니다.
 
-## 코레일+ 통합에 대해
+## 코레일+ 통합에 대해 — 코레일 경로를 쓰세요
 
-2025년 SRT·KTX 예매가 `코레일+` 앱으로 통합되면서 기존 SRT 트리거류 도구가 동작하지 않게
-되었습니다. 다만 통합 이후에도 **기존 SRT/코레일 모바일 API는 한동안 유지되는 경우가 많아**,
-이 도구는 먼저 그 경로를 사용합니다.
+SRT·KTX 예매가 `코레일+` 앱으로 통합되면서 기존 SRT 트리거류 도구가 동작하지 않게
+되었습니다. **확인된 현황:**
 
-실제로 살아있는지는 **직접 확인해야 합니다**:
+| 경로 | 상태 |
+|---|---|
+| 코레일 (`smart.letskorail.com`) | **이쪽을 사용합니다.** 모든 명령의 기본값 |
+| SRT 레거시 (`app.srail.or.kr`) | 예매 불가. 조회 경로도 오류 페이지를 반환하는 것을 확인 |
+
+그래서 `--provider` 기본값은 `korail` 입니다. SRT 어댑터는 남겨두었지만(경로가 되살아날
+경우를 대비) 예매용으로 기대하지 마세요.
+
+먼저 점검부터 하세요:
 
 ```bash
-python -m railcatch doctor --provider srt --dump
-python -m railcatch doctor --provider korail --dep 서울 --arr 부산 --dump
+python -m railcatch doctor --dump
 ```
 
-`doctor` 는 로그인 → 조회를 순서대로 시도하고, 실패하면 **서버 원본 응답을 그대로 출력**합니다.
+`doctor` 는 로그인 → 조회를 순서대로 시도하고, 어떤 경로와 앱 버전이 실제로 통했는지
+알려줍니다. 실패하면 **서버 원본 응답을 그대로 출력**합니다.
+
+응답이 JSON이 아니라 HTML 오류 페이지면 그렇다고 명시하고 페이지의 안내 문구까지 뽑아줍니다.
+SRT는 같은 기능의 경로를 여러 벌(`_n` 유무) 운영해 왔기 때문에, 후보 경로를 순서대로
+시도해 JSON을 주는 쪽을 찾아 기억합니다.
 사업자가 API를 바꿨다면 각 어댑터 파일 상단의 `WIRE FORMAT` 구역만 고치면 됩니다.
 그 구역 밖의 코드는 손댈 필요가 없도록 격리해 두었습니다.
 
@@ -91,26 +102,26 @@ python -m railcatch serve
 ### 터미널에서 바로
 
 ```bash
-# 9월 20일 수서→부산, 오전 8시~낮 12시 30분 사이, 2명
-python -m railcatch watch 수서 부산 9/20 --window 08:00-12:30 --passengers 2
+# 9월 20일 서울→부산, 오전 8시~낮 12시 30분 사이, 2명
+python -m railcatch watch 서울 부산 9/20 --window 08:00-12:30 --passengers 2
 
-# 코레일(KTX), 특실만, 특정 열차번호만
-python -m railcatch watch 서울 부산 9/20 --provider korail --seat special --trains 101 105
+# 특실만, 특정 열차번호만
+python -m railcatch watch 서울 부산 9/20 --seat special --trains 101 105
 
 # 선점하지 않고 알림만 받기
-python -m railcatch watch 수서 부산 9/20 --notify-only
+python -m railcatch watch 서울 부산 9/20 --notify-only
 
 # 30분 동안만 감시
-python -m railcatch watch 수서 부산 9/20 --timeout 30
+python -m railcatch watch 서울 부산 9/20 --timeout 30
 ```
 
 ### 그 밖의 명령
 
 ```bash
-python -m railcatch search 수서 부산 9/20      # 지금 좌석 현황만 한 번 조회
-python -m railcatch stations --provider srt     # 역 목록 보기
-python -m railcatch stations --provider korail --refresh   # 코레일 역 목록 서버에서 갱신
-python -m railcatch doctor --provider srt --dump           # 동작 점검
+python -m railcatch search 서울 부산 9/20      # 지금 좌석 현황만 한 번 조회
+python -m railcatch stations                    # 역 목록 보기
+python -m railcatch stations --refresh          # 코레일 역 목록 서버에서 갱신
+python -m railcatch doctor --dump               # 동작 점검
 ```
 
 `-v` / `-vv` 를 붙이면 로그가 자세해집니다.
@@ -160,6 +171,8 @@ python -m unittest discover -s tests -t . -v
 | 조회는 되는데 열차가 0편 | 역 이름 확인 (`stations` 명령). 코레일은 `--refresh` 로 역 목록 갱신 |
 | 좌석 상태가 전부 `unknown` | 사업자가 응답 필드를 바꿨습니다. `doctor --dump` 후 `WIRE FORMAT` 구역 수정 |
 | “요청이 거부되었습니다” | 조회 간격을 늘리고(`POLL_INTERVAL=5`) 한동안 쉬세요 |
+| “버전이 낮습니다 / 업데이트 후 이용” | 내장 버전 후보를 자동으로 재시도합니다. 계속 나오면 `.env` 의 `KORAIL_VERSION` 에 실제 코레일+ 앱 버전을 넣으세요 |
+| “JSON 대신 오류 페이지가 왔습니다” | 사업자가 해당 경로를 바꿨거나 막았습니다. `doctor --dump` 출력이 필요합니다 |
 | 텔레그램 알림이 안 옴 | 봇에게 먼저 메시지를 보냈는지, `telegram-chatid` 로 나온 값을 넣었는지 확인 |
 
 ## 라이선스

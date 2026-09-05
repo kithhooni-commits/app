@@ -25,4 +25,5 @@ def build_provider(
     p = Provider(provider)
     if p is Provider.KORAIL:
         return KorailProvider(interval=interval, data_dir=data_dir, **kwargs)
+    kwargs.pop("version", None)   # SRT는 앱 버전을 요구하지 않는다
     return SRTProvider(interval=interval, **kwargs)

@@ -84,7 +84,10 @@ def cmd_watch(args: argparse.Namespace, settings: Settings) -> int:
     spec = _spec_from_args(args)
     creds = settings.require_credentials(spec.provider)
     provider = build_provider(
-        spec.provider, interval=settings.poll_interval, data_dir=settings.data_dir
+        spec.provider,
+        interval=settings.poll_interval,
+        data_dir=settings.data_dir,
+        version=settings.korail_version or None,
     )
     notifier = build_notifier(settings)
     watch = Watch(spec, provider, notifier, (creds.user_id, creds.password))
@@ -121,7 +124,10 @@ def cmd_search(args: argparse.Namespace, settings: Settings) -> int:
     provider_enum = Provider(args.provider)
     creds = settings.require_credentials(provider_enum)
     provider = build_provider(
-        provider_enum, interval=settings.poll_interval, data_dir=settings.data_dir
+        provider_enum,
+        interval=settings.poll_interval,
+        data_dir=settings.data_dir,
+        version=settings.korail_version or None,
     )
     try:
         provider.login(creds.user_id, creds.password)
@@ -170,22 +176,27 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
         return 1
 
     provider = build_provider(
-        provider_enum, interval=settings.poll_interval, data_dir=settings.data_dir
+        provider_enum,
+        interval=settings.poll_interval,
+        data_dir=settings.data_dir,
+        version=settings.korail_version or None,
     )
     ok = True
     try:
         try:
             provider.login(creds.user_id, creds.password)
-            print("  로그인         : OK")
+            print(f"  로그인         : OK{_detail(provider)}")
         except RailCatchError as exc:
             print(f"  로그인         : 실패 — {exc}")
+            print(f"  마지막 호출    : {getattr(provider, 'last_url', None) or '-'}")
             _dump(args, provider)
             return 1
 
         day = parse_date(args.day) if args.day else (datetime.now() + timedelta(days=1)).date()
         try:
             trains = provider.search(args.dep, args.arr, day, TimeWindow().start)
-            print(f"  조회           : OK — {day} {args.dep}→{args.arr} {len(trains)}편")
+            print(f"  조회           : OK — {day} {args.dep}→{args.arr} {len(trains)}편"
+                  f"{_detail(provider)}")
             if trains:
                 t = trains[0]
                 print(f"  첫 열차        : {t.summary()} "
@@ -201,11 +212,24 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
                 ok = False
         except RailCatchError as exc:
             print(f"  조회           : 실패 — {exc}")
+            print(f"  마지막 호출    : {getattr(provider, 'last_url', None) or '-'}")
             ok = False
         _dump(args, provider)
     finally:
         provider.close()
     return 0 if ok else 1
+
+
+def _detail(provider) -> str:  # type: ignore[no-untyped-def]
+    """확정된 경로/버전처럼, 문제 생겼을 때 알아야 할 정보를 한 줄로."""
+    bits = []
+    resolved = getattr(provider, "resolved", None)
+    if resolved:
+        bits.append("경로 " + ", ".join(f"{k}={v.rsplit('/', 1)[-1]}" for k, v in resolved.items()))
+    version = getattr(provider, "version", None)
+    if version:
+        bits.append(f"앱버전 {version}")
+    return f"  ({' · '.join(bits)})" if bits else ""
 
 
 def _dump(args: argparse.Namespace, provider) -> None:  # type: ignore[no-untyped-def]
@@ -223,7 +247,10 @@ def _dump(args: argparse.Namespace, provider) -> None:  # type: ignore[no-untype
 def cmd_stations(args: argparse.Namespace, settings: Settings) -> int:
     provider_enum = Provider(args.provider)
     provider = build_provider(
-        provider_enum, interval=settings.poll_interval, data_dir=settings.data_dir
+        provider_enum,
+        interval=settings.poll_interval,
+        data_dir=settings.data_dir,
+        version=settings.korail_version or None,
     )
     try:
         if args.refresh:
@@ -315,7 +342,7 @@ def _build_parser() -> argparse.ArgumentParser:
         sp.add_argument("dep", help="출발역 (예: 수서)")
         sp.add_argument("arr", help="도착역 (예: 부산)")
         sp.add_argument("day", help="날짜 (2026-09-20 또는 9/20)")
-        sp.add_argument("--provider", choices=[p.value for p in Provider], default="srt")
+        sp.add_argument("--provider", choices=[p.value for p in Provider], default="korail")
         sp.add_argument("--window", default="00:00-23:59", help="출발 시각 구간 (예: 08:00-12:30)")
         sp.add_argument("--passengers", type=int, default=1, help="인원 (기본 1)")
 
@@ -332,15 +359,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("doctor", help="로그인/조회 점검")
-    p.add_argument("--provider", choices=[p.value for p in Provider], default="srt")
-    p.add_argument("--dep", default="수서")
+    p.add_argument("--provider", choices=[p.value for p in Provider], default="korail")
+    p.add_argument("--dep", default="서울")
     p.add_argument("--arr", default="부산")
     p.add_argument("--day", help="기본: 내일")
     p.add_argument("--dump", action="store_true", help="마지막 원본 응답 출력")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("stations", help="역 목록")
-    p.add_argument("--provider", choices=[p.value for p in Provider], default="srt")
+    p.add_argument("--provider", choices=[p.value for p in Provider], default="korail")
     p.add_argument("--refresh", action="store_true", help="서버에서 새로 받기 (코레일만)")
     p.set_defaults(func=cmd_stations)
 

@@ -42,6 +42,7 @@ class WatchManager:
                 provider,
                 interval=self.settings.poll_interval,
                 data_dir=self.settings.data_dir,
+                version=self.settings.korail_version or None,
             )
             self._providers[provider] = instance
             return instance

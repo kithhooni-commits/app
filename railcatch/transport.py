@@ -13,6 +13,7 @@ import gzip
 import json
 import logging
 import random
+import re
 import threading
 import time as _time
 import urllib.error
@@ -186,6 +187,28 @@ class Response:
             snippet = self.text[:200].replace("\n", " ")
             raise TransportError(f"HTTP {self.status} from {self.url}: {snippet!r}")
         return self
+
+
+def looks_like_html(body: str) -> bool:
+    """JSON을 기대한 자리에 돌아온 HTML 오류/안내 페이지인지.
+
+    예매 서버들은 경로나 파라미터가 틀리면 404 대신 200과 함께 사람이 읽는
+    오류 페이지를 준다. 이것을 JSON 파싱 실패로만 처리하면 원인이 가려진다.
+    """
+    head = body.lstrip()[:400].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html")
+
+
+def html_message(body: str) -> str:
+    """HTML 오류 페이지에서 사용자에게 보여줄 만한 문장을 뽑는다."""
+    import html as _html
+
+    text = re.sub(r"(?is)<(script|style|head).*?</\1>", " ", body)
+    text = re.sub(r"(?s)<!--.*?-->", " ", text)          # 주석 안 문구는 화면에 안 나온다
+    text = _html.unescape(re.sub(r"(?s)<[^>]+>", " ", text))
+    lines = [ln.strip() for ln in text.splitlines()]
+    sentences = [ln for ln in lines if len(ln) >= 6 and any("가" <= c <= "힣" for c in ln)]
+    return " / ".join(sentences[:3])[:300] if sentences else ""
 
 
 class _NoRedirectOnPost(urllib.request.HTTPRedirectHandler):
