@@ -12,6 +12,7 @@ import logging
 import threading
 from pathlib import Path
 
+from .blocklist import BlockLog
 from .config import Settings
 from .errors import ConfigError
 from .models import Provider
@@ -31,6 +32,7 @@ class WatchManager:
         self._watches: dict[str, Watch] = {}
         self._lock = threading.Lock()
         settings.data_dir.mkdir(parents=True, exist_ok=True)
+        self.blocks = BlockLog(settings.data_dir / "blocked.json")
 
     # ── provider 공유 ───────────────────────────────────────
     def provider_for(self, provider: Provider) -> RailProvider:
@@ -49,6 +51,12 @@ class WatchManager:
 
     # ── 감시 ────────────────────────────────────────────────
     def add(self, spec: WatchSpec) -> WatchStatus:
+        # 차단된 사업자에는 감시를 걸지 않는다. 실패 로그인만 쌓인다.
+        record = self.blocks.active(spec.provider)
+        if record is not None:
+            raise ConfigError(
+                f"{spec.provider.value} 는 현재 차단 상태입니다.\n{record.describe()}"
+            )
         creds = self.settings.require_credentials(spec.provider)
         if spec.auto_reserve and not creds.present:
             raise ConfigError("자동 선점을 하려면 계정 정보가 필요합니다.")

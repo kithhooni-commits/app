@@ -21,8 +21,9 @@ import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .blocklist import BlockLog
 from .config import Settings
-from .errors import RailCatchError
+from .errors import BlockedError, RailCatchError
 from .manager import WatchManager, build_notifier
 from .models import Availability, Provider, SeatClass, TimeWindow, parse_date
 from .waitlist import (
@@ -94,6 +95,8 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
 # ── watch ───────────────────────────────────────────────────
 def cmd_watch(args: argparse.Namespace, settings: Settings) -> int:
     spec = _spec_from_args(args)
+    if _blocked(args, settings, spec.provider):
+        return 2
     creds = settings.require_credentials(spec.provider)
     provider = build_provider(
         spec.provider,
@@ -126,6 +129,8 @@ def cmd_watch(args: argparse.Namespace, settings: Settings) -> int:
 
     status = watch.status
     print(f"\n{status.state}: {status.last_message}")
+    if "차단" in status.last_message:
+        _block_log(settings).record(spec.provider, status.last_message)
     return 0 if status.state == WatchState.SUCCEEDED else 1
 
 
@@ -134,6 +139,8 @@ def cmd_search(args: argparse.Namespace, settings: Settings) -> int:
     day = parse_date(args.day)
     window = TimeWindow.parse(args.window)
     provider_enum = Provider(args.provider)
+    if _blocked(args, settings, provider_enum):
+        return 2
     creds = settings.require_credentials(provider_enum)
     provider = build_provider(
         provider_enum,
@@ -186,6 +193,8 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
     print(f"  계정 설정      : {'OK' if creds.present else '없음 (.env 확인)'}")
     if not creds.present:
         return 1
+    if _blocked(args, settings, provider_enum):
+        return 2
 
     provider = build_provider(
         provider_enum,
@@ -198,6 +207,11 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
         try:
             provider.login(creds.user_id, creds.password)
             print(f"  로그인         : OK{_detail(provider)}")
+        except BlockedError as exc:
+            print(f"  로그인         : 차단됨 — {exc}")
+            _note_block(settings, provider_enum, exc)
+            _dump(args, provider)
+            return 2
         except RailCatchError as exc:
             print(f"  로그인         : 실패 — {exc}")
             print(f"  마지막 호출    : {getattr(provider, 'last_url', None) or '-'}")
@@ -358,6 +372,15 @@ def cmd_waitlist_watch(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_unblock(args: argparse.Namespace, settings: Settings) -> int:
+    provider_enum = Provider(args.provider)
+    if _block_log(settings).clear(provider_enum):
+        print(f"{provider_enum.value} 차단 기록을 지웠습니다.")
+    else:
+        print(f"{provider_enum.value} 에 대한 차단 기록이 없습니다.")
+    return 0
+
+
 # ── telegram-chatid ─────────────────────────────────────────
 def cmd_telegram_chatid(args: argparse.Namespace, settings: Settings) -> int:
     from .notify import fetch_chat_ids
@@ -375,6 +398,36 @@ def cmd_telegram_chatid(args: argparse.Namespace, settings: Settings) -> int:
         print(f"{c['chat_id']}\t{c['type']}\t{c['name']}")
     print("\n위 chat_id 를 .env 의 TELEGRAM_CHAT_ID 에 넣으세요.")
     return 0
+
+
+# ── 차단 가드 ───────────────────────────────────────────────
+def _block_log(settings: Settings) -> BlockLog:
+    return BlockLog(settings.data_dir / "blocked.json")
+
+
+def _blocked(args: argparse.Namespace, settings: Settings, provider: Provider) -> bool:
+    """차단 기록이 살아있으면 요청을 보내기 전에 막는다.
+
+    차단은 재시도로 풀리지 않는다. 계속 두드리면 실패 로그인만 쌓이고,
+    그게 계정 플래그로 번질 수 있다.
+    """
+    if getattr(args, "force", False):
+        return False
+    record = _block_log(settings).active(provider)
+    if record is None:
+        return False
+    print(f"⛔ {provider.value} 는 현재 차단 상태입니다.\n", file=sys.stderr)
+    print(record.describe(), file=sys.stderr)
+    return True
+
+
+def _note_block(settings: Settings, provider: Provider, exc: BlockedError) -> None:
+    _block_log(settings).record(provider, str(exc))
+    print(
+        "\n이 차단을 기록했습니다. 24시간 동안은 요청을 보내기 전에 자동으로 막습니다.\n"
+        "(--force 로 무시할 수 있지만 권하지 않습니다)",
+        file=sys.stderr,
+    )
 
 
 # ── 공통 ────────────────────────────────────────────────────
@@ -418,6 +471,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="railcatch", description="SRT/코레일 빈자리 감시·자동 선점")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="로그 상세도 (-v, -vv)")
     parser.add_argument("--interval", type=float, help="조회 간격(초). 2초 미만은 무시됩니다.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="차단 기록을 무시하고 시도합니다. 실패 로그인이 쌓이므로 권하지 않습니다.",
+    )
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("serve", help="웹 UI 실행")
@@ -495,6 +553,10 @@ def _build_parser() -> argparse.ArgumentParser:
     q.add_argument("--every", type=int, default=600, help="확인 주기(초). 기본 600")
     q.add_argument("--once", action="store_true", help="한 번만 확인하고 종료")
     q.set_defaults(func=cmd_waitlist_watch)
+
+    p = sub.add_parser("unblock", help="차단 기록 삭제 (사업자 정책이 바뀐 것 같을 때)")
+    p.add_argument("--provider", choices=[p.value for p in Provider], default="korail")
+    p.set_defaults(func=cmd_unblock)
 
     p = sub.add_parser("telegram-chatid", help="텔레그램 chat_id 찾기")
     p.add_argument("--token")
