@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>railcatch — 빈자리 감시</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #fff; --fg: #16181d; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#171a21; --fg:#e6e8ec; --muted:#9aa1ac;
+            --line:#262b34; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:18px; margin-bottom:16px; }
+  .grid { display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; font-weight:600; }
+  input, select { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line);
+                  background:var(--bg); color:var(--fg); font-size:14px; font-family:inherit; }
+  input:focus, select:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:14px; }
+  button { padding:9px 16px; border-radius:8px; border:1px solid transparent; cursor:pointer;
+           font-size:14px; font-weight:600; font-family:inherit; background:var(--accent); color:#fff; }
+  button.ghost { background:transparent; color:var(--muted); border-color:var(--line); font-weight:500; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .check { display:flex; align-items:center; gap:7px; font-size:13px; color:var(--fg); }
+  .check input { width:auto; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em;
+       color:var(--muted); padding:0 8px 8px; font-weight:600; }
+  td { padding:11px 8px; border-top:1px solid var(--line); vertical-align:top; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11px; font-weight:700; }
+  .running { background:color-mix(in srgb, var(--accent) 16%, transparent); color:var(--accent); }
+  .succeeded { background:color-mix(in srgb, var(--ok) 18%, transparent); color:var(--ok); }
+  .stopped { background:color-mix(in srgb, var(--muted) 20%, transparent); color:var(--muted); }
+  .failed { background:color-mix(in srgb, var(--err) 16%, transparent); color:var(--err); }
+  .msg { color:var(--muted); font-size:12px; margin-top:3px; }
+  .banner { padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:13px; display:none; }
+  .banner.err { background:color-mix(in srgb, var(--err) 14%, transparent); color:var(--err); display:block; }
+  .banner.warn { background:color-mix(in srgb, var(--warn) 14%, transparent); color:var(--warn); display:block; }
+  .empty { color:var(--muted); text-align:center; padding:28px 0; font-size:13px; }
+  .resv { margin-top:6px; padding:8px 10px; border-radius:6px; font-size:12px;
+          background:color-mix(in srgb, var(--ok) 12%, transparent); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>railcatch</h1>
+  <p class="sub">SRT · 코레일 빈자리 감시 및 자동 선점 &mdash; 결제는 앱에서 직접 하셔야 합니다.</p>
+
+  <div id="banner" class="banner"></div>
+
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label for="provider">사업자</label>
+        <select id="provider"></select>
+      </div>
+      <div>
+        <label for="dep">출발역</label>
+        <input id="dep" placeholder="수서" autocomplete="off">
+      </div>
+      <div>
+        <label for="arr">도착역</label>
+        <input id="arr" placeholder="부산" autocomplete="off">
+      </div>
+      <div>
+        <label for="day">날짜</label>
+        <input id="day" type="date">
+      </div>
+      <div>
+        <label for="from">출발 시각 (이후)</label>
+        <input id="from" type="time" value="00:00">
+      </div>
+      <div>
+        <label for="to">출발 시각 (이전)</label>
+        <input id="to" type="time" value="23:59">
+      </div>
+      <div>
+        <label for="seat">좌석</label>
+        <select id="seat"></select>
+      </div>
+      <div>
+        <label for="passengers">인원</label>
+        <input id="passengers" type="number" min="1" max="9" value="1">
+      </div>
+      <div>
+        <label for="trains">열차번호 (선택)</label>
+        <input id="trains" placeholder="301 305" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <label class="check"><input type="checkbox" id="auto" checked> 빈자리 발견 시 자동 선점</label>
+      <div style="flex:1"></div>
+      <button id="add">감시 시작</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin:0 0 12px; justify-content:space-between">
+      <strong style="font-size:14px">감시 목록</strong>
+      <button class="ghost" id="clear">완료된 항목 정리</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:42%">조건</th><th style="width:14%">상태</th>
+        <th style="width:14%">조회</th><th style="width:30%">최근</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty">감시 중인 항목이 없습니다.</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STATE_LABEL = { running:"감시중", succeeded:"성공", stopped:"중단", failed:"실패" };
+
+function banner(msg, kind) {
+  const el = $("banner");
+  if (!msg) { el.className = "banner"; el.textContent = ""; return; }
+  el.className = "banner " + (kind || "err");
+  el.textContent = msg;
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("요청 실패 (" + res.status + ")"));
+  return data;
+}
+
+async function loadMeta() {
+  const meta = await api("/api/meta");
+  $("provider").innerHTML = meta.providers.map(p =>
+    `<option value="${p.value}"${p.configured ? "" : " disabled"}>` +
+    `${p.label}${p.configured ? "" : " — 계정 미설정"}</option>`).join("");
+  $("seat").innerHTML = meta.seat_classes.map(s =>
+    `<option value="${s.value}">${s.label}</option>`).join("");
+  $("day").value = meta.today;
+  $("day").min = meta.today;
+  $("day").max = meta.max_day;
+  if (!meta.providers.some(p => p.configured)) {
+    banner(".env 에 계정 정보(SRT_ID/SRT_PW 또는 KORAIL_ID/KORAIL_PW)가 없습니다.", "err");
+  } else if (!meta.telegram) {
+    banner("텔레그램이 설정되지 않아 콘솔 알림만 갑니다. .env 의 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 를 채워주세요.", "warn");
+  }
+}
+
+function render(watches) {
+  $("empty").style.display = watches.length ? "none" : "block";
+  $("rows").innerHTML = watches.map(w => {
+    const resv = w.reservation ? `<div class="resv">예약번호 <code>${w.reservation.reservation_number}</code>` +
+      (w.reservation.pay_deadline ? ` · 결제기한 ${w.reservation.pay_deadline.slice(5,16).replace("T"," ")}` : "") +
+      `<br>앱에서 결제를 완료하세요.</div>` : "";
+    const actions = w.state === "running"
+      ? `<button class="ghost" data-stop="${w.id}">중단</button>`
+      : `<button class="ghost" data-remove="${w.id}">삭제</button>`;
+    return `<tr>
+      <td><div>${escapeHtml(w.title)}</div>${resv}<div style="margin-top:7px">${actions}</div></td>
+      <td><span class="pill ${w.state}">${STATE_LABEL[w.state] || w.state}</span></td>
+      <td>${w.attempts}회<div class="msg">오류 ${w.errors}</div></td>
+      <td><div class="msg" style="color:inherit">${escapeHtml(w.last_message)}</div>
+          <div class="msg">${w.last_checked_at ? w.last_checked_at.slice(11,19) : "-"}</div></td>
+    </tr>`;
+  }).join("");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+
+async function refresh() {
+  try { render((await api("/api/watches")).watches); }
+  catch (e) { banner("서버 연결 실패: " + e.message); }
+}
+
+$("add").addEventListener("click", async () => {
+  const btn = $("add");
+  btn.disabled = true;
+  try {
+    banner("");
+    await api("/api/watches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: $("provider").value,
+        dep: $("dep").value,
+        arr: $("arr").value,
+        day: $("day").value,
+        window: `${$("from").value || "00:00"}-${$("to").value || "23:59"}`,
+        seat_class: $("seat").value,
+        passengers: Number($("passengers").value || 1),
+        train_numbers: $("trains").value,
+        auto_reserve: $("auto").checked,
+      }),
+    });
+    await refresh();
+  } catch (e) { banner(e.message); }
+  finally { btn.disabled = false; }
+});
+
+$("clear").addEventListener("click", async () => {
+  try { await api("/api/watches/clear", { method: "POST" }); await refresh(); }
+  catch (e) { banner(e.message); }
+});
+
+$("rows").addEventListener("click", async (ev) => {
+  const stop = ev.target.dataset.stop, remove = ev.target.dataset.remove;
+  if (!stop && !remove) return;
+  try {
+    await api(stop ? "/api/watches/stop" : "/api/watches/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: stop || remove }),
+    });
+    await refresh();
+  } catch (e) { banner(e.message); }
+});
+
+loadMeta().catch(e => banner(e.message));
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
